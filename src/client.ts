@@ -42,6 +42,32 @@ export interface TaskCenterClientContext {
 /** Service key the host half is expected to publish for this browser half. */
 export const HOST_BRIDGE_KEY = 'taskCenter'
 
+/** Route the host half serves. Keep in step with `bridge.ts`. */
+export const BRIDGE_PATH = '/task-center/op'
+
+/**
+ * Call the host half over the deployment's HTTP carrier.
+ *
+ * This is the transport the host half actually provides: a route registered
+ * through `webServer`, which needs no typed-remote codegen. A published
+ * `taskCenter` service, when one exists, takes precedence in
+ * {@link adaptHostBridge}.
+ * @param method - the operation name the host dispatches.
+ * @param args - its positional JSON arguments.
+ * @returns the operation's value.
+ * @throws {Error} when the host reports a failure or the request does not land.
+ */
+async function callHost(method: string, args: readonly unknown[]): Promise<never> {
+  const response = await fetch(BRIDGE_PATH, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ method, args }),
+  })
+  const payload = await response.json() as { ok?: boolean; value?: unknown; error?: string }
+  if (payload.ok !== true) throw new Error(payload.error ?? `task-center: ${method} failed`)
+  return payload.value as never
+}
+
 /**
  * Wrap one unknown host value as the browser API.
  *
@@ -55,10 +81,10 @@ export function adaptHostBridge(host: unknown): TaskCenterUiApi {
   const source = (host ?? {}) as Record<string, unknown>
   const call = (method: string, ...args: unknown[]): Promise<never> => {
     const fn = source[method]
-    if (typeof fn !== 'function') {
-      return Promise.reject(new Error(`task-center: host bridge has no "${method}"`))
+    if (typeof fn === 'function') {
+      return Promise.resolve((fn as (...a: unknown[]) => unknown).apply(host, args)) as Promise<never>
     }
-    return Promise.resolve((fn as (...a: unknown[]) => unknown).apply(host, args)) as Promise<never>
+    return callHost(method, args)
   }
   return {
     snapshot: async (): Promise<{ now: string; tasks: readonly UiTask[] }> => {
@@ -91,10 +117,9 @@ export function adaptHostBridge(host: unknown): TaskCenterUiApi {
  * @returns nothing; every side effect belongs to the calling fiber.
  */
 export function apply(ctx: TaskCenterClientContext): void {
+  // A published service wins; otherwise every call goes over the HTTP route the
+  // host half registers, which is the transport this package actually ships.
   const host = ctx.get(HOST_BRIDGE_KEY)
-  if (host === undefined || host === null) {
-    console.error(`task-center: no "${HOST_BRIDGE_KEY}" service on the client plane; surfaces mount empty`)
-  }
   const release = registerTaskCenterUi({
     slots: ctx.slots,
     api: adaptHostBridge(host),

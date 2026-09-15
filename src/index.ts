@@ -14,6 +14,9 @@ import { TaskPersistence, type TaskPersistenceOptions } from './persistence.js'
 import { Scheduler } from './scheduler.js'
 import { TaskStore, summarize, type TaskStoreOptions, type TaskSummary } from './store.js'
 import { aggregateStatus, type Task, type TaskCenterState } from './domain.js'
+import { BRIDGE_PATH, dispatch, type BridgeHost } from './bridge.js'
+import type { UiSession, UiWorkspace } from './ui.js'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 
 export * from './domain.js'
 export * from './schedule.js'
@@ -195,6 +198,105 @@ export function apply(ctx: TaskCenterHostContext, config: Config = {}): void {
   })
   void center.start()
   registerTaskTools(ctx, center, config)
+  registerBridgeRoute(ctx, center)
+}
+
+/** The slice of the browser HTTP carrier this plugin registers on. */
+interface WebServerLike {
+  register(route: {
+    kind: 'exact'
+    path: string
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  }): () => void
+}
+
+/** Read a complete request body and decode it as JSON. */
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = []
+  for await (const chunk of req) chunks.push(Buffer.from(chunk as Uint8Array))
+  const text = Buffer.concat(chunks).toString('utf8')
+  return text === '' ? {} : JSON.parse(text)
+}
+
+/** Write one JSON response. */
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const text = JSON.stringify(body)
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(text)
+}
+
+/** Read the picker options from whatever registry services this host mounted. */
+async function collectChoices(ctx: TaskCenterHostContext): Promise<{ workspaces: UiWorkspace[]; sessions: UiSession[] }> {
+  const workspaces: UiWorkspace[] = []
+  const sessions: UiSession[] = []
+  const registry = ctx.get('workspaceRegistry') as { list?: () => Array<Record<string, unknown>> } | undefined
+  if (registry !== undefined && typeof registry.list === 'function') {
+    try {
+      for (const entry of registry.list()) {
+        workspaces.push({ id: String(entry['id']), title: String(entry['title'] ?? ''), path: String(entry['path'] ?? '') })
+      }
+    } catch (error) {
+      console.error(`task-center: workspace listing failed: ${messageOf(error)}`)
+    }
+  }
+  const query = ctx.get('sessionQuery') as { listSessions?: (signal?: AbortSignal) => Promise<Array<Record<string, unknown>>> } | undefined
+  if (query !== undefined && typeof query.listSessions === 'function') {
+    try {
+      for (const record of (await query.listSessions()).slice(0, 50)) {
+        const header = (record['header'] ?? {}) as Record<string, unknown>
+        sessions.push({
+          id: String(header['id']),
+          title: null,
+          live: record['live'] === true,
+        })
+      }
+    } catch (error) {
+      console.error(`task-center: session listing failed: ${messageOf(error)}`)
+    }
+  }
+  return { workspaces, sessions }
+}
+
+/**
+ * Serve the browser half over the deployment's HTTP carrier.
+ *
+ * A route rather than a generated remote keeps the bridge independent of the
+ * harness's typed-remote codegen, which this package deliberately does not
+ * import. Missing carrier, or a rejected registration, costs the UI its data
+ * and nothing else.
+ * @param ctx - the host context to register on.
+ * @param center - the running engine the bridge mutates.
+ */
+export function registerBridgeRoute(ctx: TaskCenterHostContext, center: TaskCenter): void {
+  const server = ctx.get('webServer') as WebServerLike | undefined
+  if (server === undefined || server === null || typeof server.register !== 'function') {
+    console.error('task-center: no webServer service; the browser half will have no data')
+    return
+  }
+  const host: BridgeHost = {
+    store: center.store,
+    wake: () => { center.scheduler.wake() },
+    choices: () => collectChoices(ctx),
+  }
+  const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, error: 'method_not_allowed' })
+      return
+    }
+    try {
+      const body = (await readJsonBody(req)) as { method?: unknown; args?: unknown }
+      const method = typeof body.method === 'string' ? body.method : ''
+      const args = Array.isArray(body.args) ? body.args : []
+      sendJson(res, 200, { ok: true, value: await dispatch(host, method, args) })
+    } catch (error: unknown) {
+      sendJson(res, 400, { ok: false, error: messageOf(error) })
+    }
+  }
+  try {
+    ctx.effect(() => server.register({ kind: 'exact', path: BRIDGE_PATH, handler }))
+  } catch (error) {
+    console.error(`task-center: bridge route was rejected: ${messageOf(error)}`)
+  }
 }
 
 /**
