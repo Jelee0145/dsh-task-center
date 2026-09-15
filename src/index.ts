@@ -207,7 +207,14 @@ export function apply(ctx: TaskCenterHostContext, config: Config = {}): void {
 export function registerTaskTools(ctx: TaskCenterHostContext, center: TaskCenter, config: Config = {}): void {
   const define = config.defineTool ?? ((definition: TaskToolDefinition) => definition)
   for (const definition of buildTaskTools(center)) {
-    ctx.tools.register(define(definition))
+    // One rejected registration must not take the host down with it: this seam
+    // is structural, so a harness whose tool contract differs should lose a
+    // tool and log it, not fail the whole plugin load.
+    try {
+      ctx.tools.register(define(definition))
+    } catch (error) {
+      console.error(`task-center: tool "${definition.name}" was rejected: ${messageOf(error)}`)
+    }
   }
 }
 

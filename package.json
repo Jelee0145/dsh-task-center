@@ -19,11 +19,20 @@
       "types": "./lib/types/client.d.ts",
       "default": "./lib/client.js"
     },
+    "./shared": {
+      "types": "./lib/types/shared.d.ts",
+      "default": "./lib/shared.js"
+    },
     "./ui": {
       "types": "./lib/types/ui.d.ts",
       "default": "./lib/ui.js"
     },
     "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
   },
   "files": [
     "lib/**/*.js",
