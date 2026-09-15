@@ -1,5 +1,5 @@
 {
-  "name": "dsh-task-center",
+  "name": "@lyzi_nya/dsh-task-center",
   "version": "0.1.0",
   "private": false,
   "description": "Durable to-do and scheduled-task engine for the DeepSeek Harness: per-execution run records, a timer scheduler, model tools, and atomic versioned JSON persistence.",
@@ -42,6 +42,9 @@
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json",
     "prepack": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

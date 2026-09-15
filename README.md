@@ -1,4 +1,4 @@
-# dsh-task-center
+# @lyzi_nya/dsh-task-center
 
 Durable to-do and scheduled-task engine for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
@@ -22,7 +22,7 @@ This is version `0.1.0`, extracted from a working prototype. Be precise about wh
 ## Install
 
 ```sh
-npm install dsh-task-center
+npm install @lyzi_nya/dsh-task-center
 ```
 
 Zero runtime dependencies. Node `>=22.19`.
