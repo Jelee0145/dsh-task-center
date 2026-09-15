@@ -53,8 +53,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.build.json",
-    "prepack": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json && tsdown",
+    "prepack": "tsc -p tsconfig.build.json && tsdown"
   },
   "publishConfig": {
     "access": "public"
@@ -71,6 +71,7 @@
     "@types/node": "^24.0.0",
     "@types/react": "^18.3.0",
     "react": "^18.3.1",
+    "tsdown": "^0.22.2",
     "typescript": "^5.9.0",
     "vitest": "^4.1.8"
   }

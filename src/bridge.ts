@@ -21,6 +21,8 @@ export interface BridgeHost {
   readonly store: TaskStore
   /** Re-arm the scheduler after a mutation that changed a plan. */
   wake(): void
+  /** Start one execution now, without changing the task's plan. */
+  startNow(taskId: string): { task: Task; run: Run }
   /** Workspace and session options for the browser pickers. */
   choices(): Promise<{ workspaces: UiWorkspace[]; sessions: UiSession[] }>
 }
@@ -124,10 +126,8 @@ export async function dispatch(
     case 'remove':
       return { ok: true, deleted: mutate(store.deleteTask(requireString(args, 0, 'id'))) !== undefined }
     case 'runNow': {
-      const task = store.requireTask(requireString(args, 0, 'id'))
-      const started = store.startRun(task.id, { trigger: 'manual', prompt: task.title })
-      host.wake()
-      return { ok: true, taskId: String(task.id), runId: String(started.run.id) }
+      const started = host.startNow(requireString(args, 0, 'id'))
+      return { ok: true, taskId: String(started.task.id), runId: String(started.run.id) }
     }
     case 'pause':
       return { ok: true, task: toUiTask(mutate(store.pause(requireString(args, 0, 'id')))) }

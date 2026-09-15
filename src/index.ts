@@ -13,8 +13,9 @@
 import { TaskPersistence, type TaskPersistenceOptions } from './persistence.js'
 import { Scheduler } from './scheduler.js'
 import { TaskStore, summarize, type TaskStoreOptions, type TaskSummary } from './store.js'
-import { aggregateStatus, type Task, type TaskCenterState } from './domain.js'
+import { aggregateStatus, type Run, type Task, type TaskCenterState } from './domain.js'
 import { BRIDGE_PATH, dispatch, type BridgeHost } from './bridge.js'
+import { createAgentRunner, enrichPrompt } from './runner.js'
 import type { UiSession, UiWorkspace } from './ui.js'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
@@ -23,6 +24,7 @@ export * from './schedule.js'
 export * from './store.js'
 export * from './scheduler.js'
 export * from './persistence.js'
+export * from './runner.js'
 
 /** Stable plugin name and Cordis injection list. */
 export const name = 'dsh-task-center'
@@ -64,6 +66,8 @@ export interface TaskCenter {
   readonly store: TaskStore
   readonly persistence: TaskPersistence
   readonly scheduler: Scheduler
+  /** Start one execution now, without changing the task's plan. */
+  startNow(taskId: string): { task: Task; run: Run }
   /** Load persisted state, then arm the scheduler. */
   start(): Promise<void>
   /** Flush and release everything. Safe to call more than once. */
@@ -85,7 +89,7 @@ export function createTaskCenter(options: TaskCenterOptions = {}): TaskCenter {
 
   let disposed = false
 
-  const run = async (task: Task): Promise<void> => {
+  const execute = async (task: Task): Promise<void> => {
     const runner = options.runner
     if (runner === undefined) {
       store.finishRun(task.id, latestRunId(task), { status: 'failed', error: 'no_runner' })
@@ -93,7 +97,7 @@ export function createTaskCenter(options: TaskCenterOptions = {}): TaskCenter {
     }
     const runId = latestRunId(task)
     try {
-      const { sessionId } = await runner.execute(task, task.title)
+      const { sessionId } = await runner.execute(task, enrichPrompt(task))
       store.finishRun(task.id, runId, { status: 'completed', sessionId })
     } catch (error: unknown) {
       store.finishRun(task.id, runId, { status: 'failed', error: messageOf(error) })
@@ -103,7 +107,7 @@ export function createTaskCenter(options: TaskCenterOptions = {}): TaskCenter {
 
   const scheduler = new Scheduler({
     store,
-    run,
+    run: execute,
     ...(options.segmentMs === undefined ? {} : { segmentMs: options.segmentMs }),
     ...(options.onError === undefined ? {} : { onError: options.onError }),
   })
@@ -117,6 +121,19 @@ export function createTaskCenter(options: TaskCenterOptions = {}): TaskCenter {
     store,
     persistence,
     scheduler,
+    startNow(taskId: string): { task: Task; run: Run } {
+      const target = store.requireTask(taskId)
+      const prompt = enrichPrompt(target)
+      const { task, run } = store.startRun(taskId, {
+        trigger: 'manual',
+        prompt,
+        enriched: prompt !== target.title,
+      })
+      // A manual run carries no schedule, so the scheduler's due-task loop can
+      // never reach it. Dispatch it here or it stays `running` forever.
+      void execute(task).catch((error: unknown) => { report(options.onError, error) })
+      return { task, run }
+    },
     async start(): Promise<void> {
       const loaded = await persistence.load()
       store.replaceState(loaded.state)
@@ -194,7 +211,7 @@ export interface Config extends TaskCenterOptions {
  * @returns nothing; every side effect is owned by the calling fiber.
  */
 export function apply(ctx: TaskCenterHostContext, config: Config = {}): void {
-  const center = createTaskCenter(config)
+  const center = createTaskCenter({ ...config, runner: config.runner ?? createAgentRunner(ctx) })
   ctx.effect(() => () => {
     void center.dispose()
   })
@@ -273,6 +290,7 @@ export function registerBridgeRoute(ctx: TaskCenterHostContext, center: TaskCent
   const host: BridgeHost = {
     store: center.store,
     wake: () => { center.scheduler.wake() },
+    startNow: taskId => center.startNow(taskId),
     choices: () => collectChoices(ctx),
   }
   const handler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
@@ -342,6 +360,40 @@ function renderJson(value: unknown): unknown {
   return [{ type: 'text', text: JSON.stringify(value) }]
 }
 
+/** One parameter, as the harness tool DSL declares it. */
+interface ParameterSpec {
+  readonly type: string
+  readonly description: string
+  readonly enum?: readonly string[]
+  readonly required?: boolean
+}
+
+/**
+ * Compile a parameter map into the object-rooted JSON Schema the tool registry
+ * forwards to the model.
+ *
+ * The harness's own `defineTool` performs exactly this compilation; this plugin
+ * compiles in place instead, so it imports nothing from the harness. The step is
+ * not optional: a definition registered without it reaches the model as the raw
+ * parameter map — no `type`, no `properties` — which is not a usable schema.
+ * @param spec - parameter name to declaration.
+ * @returns the model-facing JSON Schema.
+ */
+function compileParameters(spec: Record<string, ParameterSpec>): Record<string, unknown> {
+  const properties: Record<string, unknown> = {}
+  const required: string[] = []
+  for (const [name, parameter] of Object.entries(spec)) {
+    const { required: isRequired, ...node } = parameter
+    if (isRequired === true) required.push(name)
+    properties[name] = node
+  }
+  return {
+    type: 'object',
+    properties,
+    ...(required.length === 0 ? {} : { required }),
+  }
+}
+
 /** The task list shape a tool returns. The core owns both rules. */
 function summarizeAll(center: TaskCenter): TaskSummary[] {
   return center.store.listTasks().map(summarize)
@@ -362,7 +414,16 @@ export function buildTaskTools(center: TaskCenter): TaskToolDefinition[] {
     {
       name: 'task_list',
       description: 'List tasks (to-dos and scheduled jobs) owned by this harness, including their aggregate status and next fire time.',
-      parameters: { status: { type: 'string' }, include_runs: { type: 'boolean' } },
+      parameters: compileParameters({
+        status: {
+          type: 'string',
+          description: 'Keep only tasks whose aggregate status equals this value.',
+        },
+        include_runs: {
+          type: 'boolean',
+          description: 'Include the execution history of every returned task.',
+        },
+      }),
       output: { schema: { type: 'object' }, render: (_args: never, value: never) => renderJson(value) },
       async execute(args: unknown): Promise<unknown> {
         const input = (args ?? {}) as { status?: unknown }
@@ -374,7 +435,10 @@ export function buildTaskTools(center: TaskCenter): TaskToolDefinition[] {
     {
       name: 'task_create',
       description: 'Create a to-do, optionally with an execution plan that turns it into a scheduled job.',
-      parameters: { title: { type: 'string', required: true }, note: { type: 'string' } },
+      parameters: compileParameters({
+        title: { type: 'string', required: true, description: 'What the task is.' },
+        note: { type: 'string', description: 'Optional detail to keep with the task.' },
+      }),
       output: { schema: { type: 'object' }, render: (_args: never, value: never) => renderJson(value) },
       async execute(args: unknown): Promise<unknown> {
         const input = (args ?? {}) as { title?: unknown; note?: unknown }
@@ -388,13 +452,17 @@ export function buildTaskTools(center: TaskCenter): TaskToolDefinition[] {
     {
       name: 'task_update',
       description: 'Change a task, or settle one of its executions as completed or failed. Only the user can accept an execution or complete a task.',
-      parameters: {
-        id: { type: 'string', required: true },
-        title: { type: 'string' },
-        note: { type: 'string' },
-        run_id: { type: 'string' },
-        run_status: { type: 'string', enum: ['completed', 'failed'] },
-      },
+      parameters: compileParameters({
+        id: { type: 'string', required: true, description: 'The task to change.' },
+        title: { type: 'string', description: 'Replacement title.' },
+        note: { type: 'string', description: 'Replacement note.' },
+        run_id: { type: 'string', description: 'The execution to settle.' },
+        run_status: {
+          type: 'string',
+          enum: ['completed', 'failed'],
+          description: 'The outcome of that execution. Only the user accepts it or completes the task.',
+        },
+      }),
       output: { schema: { type: 'object' }, render: (_args: never, value: never) => renderJson(value) },
       async execute(args: unknown): Promise<unknown> {
         const input = (args ?? {}) as { id?: unknown; run_id?: unknown; run_status?: unknown; title?: unknown; note?: unknown }
@@ -419,21 +487,23 @@ export function buildTaskTools(center: TaskCenter): TaskToolDefinition[] {
     {
       name: 'task_run',
       description: 'Run a task now without changing its plan or next scheduled time. The user is asked to accept the result afterwards.',
-      parameters: { id: { type: 'string', required: true } },
+      parameters: compileParameters({
+        id: { type: 'string', required: true, description: 'The task to act on.' },
+      }),
       output: { schema: { type: 'object' }, render: (_args: never, value: never) => renderJson(value) },
       async execute(args: unknown): Promise<unknown> {
         const input = (args ?? {}) as { id?: unknown }
         const id = String(input.id)
-        const task = store.requireTask(id)
-        const { run } = store.startRun(id, { trigger: 'manual', prompt: task.title })
-        center.scheduler.wake()
+        const { run } = center.startNow(id)
         return { ok: true, taskId: id, runId: run.id }
       },
     },
     {
       name: 'task_delete',
       description: 'Delete a task permanently. Its execution history goes with it; sessions it created are untouched.',
-      parameters: { id: { type: 'string', required: true } },
+      parameters: compileParameters({
+        id: { type: 'string', required: true, description: 'The task to act on.' },
+      }),
       output: { schema: { type: 'object' }, render: (_args: never, value: never) => renderJson(value) },
       async execute(args: unknown): Promise<unknown> {
         const input = (args ?? {}) as { id?: unknown }

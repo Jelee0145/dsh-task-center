@@ -23,7 +23,13 @@ import {
 /** Stable plugin name; matches the row id in a composition. */
 export const name = '@lyzi_nya/dsh-task-center'
 
-/** Services this browser half waits for before activating. */
+/**
+ * Services this browser half waits for before activating.
+ *
+ * Only `slots` is declared. The interval mixin the poller prefers is read
+ * opportunistically, so naming the host's timer service here would make a
+ * deployment that does not mount it wait forever and show no UI at all.
+ */
 export const inject = ['slots'] as const
 
 /**
@@ -108,6 +114,28 @@ export function adaptHostBridge(host: unknown): TaskCenterUiApi {
 }
 
 /**
+ * Select the task center main panel through the layout service.
+ *
+ * `usePanelInfo` is read-only, so opening the panel goes through
+ * `layout.selectPanel`. That call throws for an unregistered key; this plugin
+ * registers the matching `main` entry, and the throw is swallowed so it cannot
+ * break the render tree. The service is read at click time rather than
+ * declared in `inject`, so the plugin never waits on a service the deployment
+ * may not mount.
+ * @param ctx - the client context to read the layout service from.
+ * @returns nothing.
+ */
+function openTasksPanel(ctx: TaskCenterClientContext): void {
+  const layout = ctx.get('layout') as { selectPanel?: (panelId: string) => void } | undefined
+  if (layout === undefined || typeof layout.selectPanel !== 'function') return
+  try {
+    layout.selectPanel('tasks')
+  } catch {
+    // An unregistered panel key throws; keeping the current panel is correct.
+  }
+}
+
+/**
  * Register the task-center surfaces on one client context.
  *
  * Activation is not blocked on the host bridge: a missing bridge is logged and
@@ -123,6 +151,7 @@ export function apply(ctx: TaskCenterClientContext): void {
   const release = registerTaskCenterUi({
     slots: ctx.slots,
     api: adaptHostBridge(host),
+    openTasks: () => { openTasksPanel(ctx) },
     ...(ctx.interval === undefined ? {} : { interval: ctx.interval }),
   })
   if (ctx.effect !== undefined) ctx.effect(() => release)

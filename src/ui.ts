@@ -82,6 +82,12 @@ export interface TaskCenterUiOptions {
   readonly interval?: (callback: () => void, delayMs: number) => () => void
   /** Injects one stylesheet. */
   readonly insertStyles?: (css: string) => void
+  /**
+   * Selects the task center main panel. The client half resolves it from the
+   * layout service at click time, so this plugin never waits for a service the
+   * deployment may not mount.
+   */
+  readonly openTasks?: () => void
 }
 
 const STATUS_LABEL: Record<AggregateStatus, string> = {
@@ -178,14 +184,14 @@ export function sortTasks(tasks: readonly UiTask[]): UiTask[] {
 }
 
 const CSS = [
-  '.dt-dock{display:flex;flex-direction:column;gap:6px;margin:0 auto 8px;width:100%;box-sizing:border-box;}',
+  '.dt-dock{display:flex;flex-direction:column;gap:6px;flex:none;overflow:hidden;margin:0 auto;box-sizing:border-box;width:calc(100% - 2*var(--dsh-composer-side-clearance,16px) - 4*var(--dsh-composer-dock-inset,8px));max-width:calc(var(--dsh-composer-card-max-width,100%) - 4*var(--dsh-composer-dock-inset,8px));border-radius:12px;}',
   '.dt-head{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-secondary);padding:0 4px;flex:none;}',
   '.dt-head strong{font-weight:600;color:var(--dsw-alias-label-primary);}',
   '.dt-spacer{flex:1;}',
   '.dt-muted{font-size:11px;color:var(--dsw-alias-label-secondary);}',
   '.dt-card{display:flex;flex-direction:column;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;overflow:hidden;background:var(--dsw-alias-bg-layer-1);}',
   '.dt-list{overflow-y:auto;overscroll-behavior:contain;}',
-  '.dt-page-list{flex:1 1 auto;min-height:0;overflow-y:auto;max-height:calc(100vh - 240px);}',
+  '.dt-page-list{flex:1 1 auto;min-height:0;overflow-y:auto;}',
   '.dt-drawer-list{flex:1 1 auto;min-height:0;overflow-y:auto;border:none;border-radius:0;}',
   '.dt-drawer-toolbar{flex:none;display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);}',
   '.dt-row{display:flex;flex-direction:column;gap:4px;padding:8px 10px;border-bottom:1px solid var(--dsw-alias-border-l1);}',
@@ -220,7 +226,7 @@ const CSS = [
   '.dt-step-on{color:var(--dsw-alias-brand-primary);}',
   '.dt-foot{display:flex;gap:8px;align-items:center;}',
   '.dt-note{font-size:11px;color:var(--dsw-alias-state-error-primary);}',
-  '.dt-pop{position:relative;}',
+  '.dt-modal{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;pointer-events:auto;}',
   '.dt-page{display:flex;flex:1 1 auto;flex-direction:column;gap:10px;padding:16px;box-sizing:border-box;height:100%;min-height:0;overflow:hidden;}',
   '.dt-page-head{display:flex;align-items:center;gap:10px;flex:none;}',
   '.dt-page-head h2{font-size:15px;margin:0;color:var(--dsw-alias-label-primary);}',
@@ -228,8 +234,8 @@ const CSS = [
   '.dt-icon-btn{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;}',
   '.dt-icon-btn:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);}',
   '.dt-badge{font-size:10px;line-height:14px;min-width:14px;text-align:center;border-radius:999px;padding:0 4px;background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base);}',
-  '.dt-backdrop{position:fixed;inset:0;pointer-events:auto;background:transparent;}',
-  '.dt-drawer{position:fixed;top:0;right:0;bottom:0;width:min(440px,92vw);pointer-events:auto;display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1);border-left:1px solid var(--dsw-alias-border-l1);box-shadow:-10px 0 28px rgba(0,0,0,.20);}',
+  '.dt-backdrop{position:fixed;inset:0;pointer-events:auto;background:rgba(0,0,0,.32);}',
+  '.dt-drawer{position:relative;pointer-events:auto;display:flex;flex-direction:column;width:min(560px,100%);max-height:min(80vh,760px);overflow:hidden;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;box-shadow:0 18px 48px rgba(0,0,0,.28);}',
   '.dt-drawer-head{flex:none;display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--dsw-alias-border-l1);}',
   '.dt-drawer-head h2{font-size:14px;margin:0;color:var(--dsw-alias-label-primary);}',
   '.dt-drawer-body{flex:1 1 auto;min-height:0;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:14px;}',
@@ -397,57 +403,133 @@ interface SurfaceProps {
   readonly sessionId?: string | undefined
 }
 
-/** The home-page dock: shown only while the session summary is blank. */
-function HomeDock(props: SurfaceProps & { readonly useSessions?: unknown }): ReactNode | null {
-  const state = useStore(props.store)
-  const [open, setOpen] = useState(false)
-  const tasks = sortTasks(state.tasks)
-  const openTask = (id: string): void => { props.store.setDrawer({ mode: 'detail', taskId: id, back: null }) }
-  return createElement('div', { style: { padding: '0 16px' } },
-    createElement('div', { className: 'dt-dock' },
-      createElement('div', { className: 'dt-head' },
-        createElement('strong', null, '待办'),
-        createElement('span', null,
-          `共 ${tasks.length} 条 · ${tasks.filter(task => task.status !== 'done').length} 项未完成`),
-        createElement('span', { className: 'dt-spacer' }),
-        createElement('button', {
-          className: 'dt-btn',
-          onClick: () => { props.store.setDrawer({ mode: 'create', sessionId: props.sessionId }) },
-        }, '＋ 新建'),
-        createElement('button', {
-          className: 'dt-btn',
-          onClick: () => { props.store.setDrawer({ mode: 'list', scope: 'all', sessionId: props.sessionId }) },
-        }, '在侧栏展开'),
-        tasks.length <= 4 ? null : createElement('button', {
-          className: 'dt-btn',
-          onClick: () => setOpen(!open),
-        }, open ? '收起' : '展开（可滚动）'),
-      ),
-      createElement(TaskList, {
-        className: 'dt-card',
-        style: { maxHeight: open ? '46vh' : '184px' },
-        tasks,
-        empty: '暂无待办，点「＋ 新建」创建。',
-        store: props.store,
-        api: props.api,
-        openTask,
-      }),
-    ))
+/** One selector hook the runtime binds from the standard session share. */
+interface SlotSelectorHook { (select: (snapshot: never) => unknown): unknown }
+
+/** Selector hooks a session-scoped surface reads its standard snapshots through. */
+interface SurfaceStandardProps {
+  readonly useSession?: SlotSelectorHook | undefined
+  readonly useConversation?: SlotSelectorHook | undefined
+  readonly useSessions?: SlotSelectorHook | undefined
 }
 
-/** The session header button: opens the same drawer in list mode. */
-function SessionTasksButton(props: SurfaceProps): ReactNode {
+/** Session lifecycle facts the dock reads off `useSession`. */
+interface DockSessionFacts {
+  readonly blank?: boolean | undefined
+  readonly awaitingFirstTurn?: boolean | undefined
+  readonly running?: boolean | undefined
+  readonly promptAttempted?: boolean | undefined
+  readonly openState?: string | undefined
+}
+
+/** Conversation facts the dock reads off `useConversation`. */
+interface DockConversationFacts { readonly activeTargets?: { readonly size: number } | undefined }
+
+/** Session roster summary the dock reads the current Session's blank flag from. */
+interface DockSessionsFacts {
+  readonly byId?: Record<string, { readonly blank?: boolean | undefined } | undefined> | undefined
+}
+
+/** Props of the home-page dock. */
+type HomeDockProps = SurfaceProps & SurfaceStandardProps
+
+/**
+ * Read one value from a selector hook the slot supplies.
+ *
+ * A deployment that does not supply the hook, or a selector that throws, yields
+ * `undefined` instead of breaking the render tree.
+ * @param hook - the runtime selector hook, when the slot supplied one.
+ * @param select - projection over the hook's snapshot.
+ * @returns the projected value, or `undefined` when it cannot be read.
+ */
+function readSlotSelector<T>(hook: SlotSelectorHook | undefined, select: (snapshot: never) => T): T | undefined {
+  if (typeof hook !== 'function') return undefined
+  try {
+    return hook(select) as T
+  } catch {
+    // A selector running against an unexpected snapshot must not blank the dock.
+    return undefined
+  }
+}
+
+/**
+ * The home-page dock. It renders its rows only on the hero (home / new-session)
+ * page and nothing at all inside an established conversation: the host's dock
+ * seat imposes no geometry, so an entry that renders there misaligns against
+ * the composer card.
+ */
+function HomeDock(props: HomeDockProps): ReactNode | null {
   const state = useStore(props.store)
-  const open = state.tasks.filter(task =>
-    (task.originSessionId === props.sessionId || task.targetSessionId === props.sessionId) && task.status !== 'done')
-  return createElement('div', { className: 'dt-pop' },
-    createElement('button', {
-      className: 'dt-icon-btn',
-      title: '任务',
-      onClick: () => { props.store.setDrawer({ mode: 'list', scope: 'session', sessionId: props.sessionId }) },
-    },
-    createElement('span', null, '任务'),
-    open.length === 0 ? null : createElement('span', { className: 'dt-badge' }, String(open.length))))
+  const [open, setOpen] = useState(false)
+  const session = readSlotSelector(props.useSession, snapshot => snapshot as DockSessionFacts)
+  const conversation = readSlotSelector(props.useConversation, snapshot => snapshot as DockConversationFacts)
+  const sessions = readSlotSelector(props.useSessions, snapshot => snapshot as DockSessionsFacts)
+  const summaryBlank = props.sessionId === undefined ? undefined : sessions?.byId?.[props.sessionId]?.blank
+  const active = conversation !== undefined && session !== undefined
+    && ((conversation.activeTargets?.size ?? 0) > 0
+      || (!session.blank && !session.awaitingFirstTurn)
+      || session.running === true)
+  const shellPhase = session === undefined || conversation === undefined
+    ? 'blank'
+    : active ? 'active' : (session.promptAttempted === true ? 'engaging' : 'blank')
+  const hero = shellPhase === 'blank' && (session?.openState === 'open' || summaryBlank === true)
+  if (!hero) return null
+  const tasks = sortTasks(state.tasks)
+  const openTask = (id: string): void => { props.store.setDrawer({ mode: 'detail', taskId: id, back: null }) }
+  return createElement('div', { className: 'dt-dock' },
+    createElement('div', { className: 'dt-head' },
+      createElement('strong', null, '待办'),
+      createElement('span', null,
+        `共 ${tasks.length} 条 · ${tasks.filter(task => task.status !== 'done').length} 项未完成`),
+      createElement('span', { className: 'dt-spacer' }),
+      createElement('button', {
+        className: 'dt-btn',
+        onClick: () => { props.store.setDrawer({ mode: 'create', sessionId: props.sessionId }) },
+      }, '＋ 新建'),
+      createElement('button', {
+        className: 'dt-btn',
+        onClick: () => { props.store.setDrawer({ mode: 'list', scope: 'all', sessionId: props.sessionId }) },
+      }, '在侧栏展开'),
+      tasks.length <= 4 ? null : createElement('button', {
+        className: 'dt-btn',
+        onClick: () => setOpen(!open),
+      }, open ? '收起' : '展开（可滚动）'),
+    ),
+    createElement(TaskList, {
+      className: 'dt-card',
+      style: { maxHeight: open ? '46vh' : '184px' },
+      tasks,
+      empty: '暂无待办，点「＋ 新建」创建。',
+      store: props.store,
+      api: props.api,
+      openTask,
+    }))
+}
+
+/** Props of the session header button; `openTasks` arrives through the register inject factory. */
+type SessionTasksButtonProps = SurfaceProps & { readonly openTasks?: (() => void) | undefined }
+
+/**
+ * The session header button: one inline control that selects the task center
+ * main panel. The host's utilities row is a bare `flex: none` strip, so an
+ * oversized child would grow the header; the layout service is reached through
+ * the injected `openTasks` callback rather than from this component.
+ */
+function SessionTasksButton(props: SessionTasksButtonProps): ReactNode {
+  const state = useStore(props.store)
+  const sessionId = props.sessionId
+  const open = state.tasks.filter(task => task.status !== 'done'
+    && (sessionId === undefined || task.originSessionId === sessionId || task.targetSessionId === sessionId))
+  const openTasks = props.openTasks
+  return createElement('button', {
+    type: 'button',
+    className: 'dt-icon-btn',
+    title: '任务中心',
+    'aria-label': '任务中心',
+    onClick: () => { if (typeof openTasks === 'function') openTasks() },
+  },
+  createElement('span', null, '任务'),
+  open.length === 0 ? null : createElement('span', { className: 'dt-badge' }, String(open.length)))
 }
 
 /** The task center page. */
@@ -481,13 +563,30 @@ function TaskCenter(props: SurfaceProps): ReactNode {
     }))
 }
 
-/** The sidebar panel icon. */
-function PanelIcon(props: { size: number }): ReactNode {
-  return createElement('svg', { viewBox: '0 0 16 16', width: props.size, height: props.size, 'aria-hidden': true },
-    createElement('path', {
-      fill: 'currentColor',
-      d: 'M2.5 2.5h11a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Zm.5 2v1h2v-1H3Zm3.5 0v1H13v-1H6.5Zm-3.5 3v1h2v-1H3Zm3.5 0v1H13v-1H6.5Zm-3.5 3v1h2v-1H3Zm3.5 0v1H13v-1H6.5Z',
-    }))
+/**
+ * The sidebar panel icon.
+ *
+ * The sidebar draws the row itself from this registration's metadata and
+ * mounts the component only inside a 16/18px `aria-hidden` span, so it stays a
+ * bare inline SVG glyph sized and tinted from its owner props: text, cards, or
+ * block layout here would break the rail.
+ */
+function PanelIcon(props: { readonly size?: number | undefined; readonly active?: boolean | undefined }): ReactNode {
+  const size = typeof props.size === 'number' && props.size > 0 ? props.size : 16
+  return createElement('svg', {
+    viewBox: '0 0 16 16',
+    width: size,
+    height: size,
+    'aria-hidden': true,
+    style: {
+      display: 'block',
+      color: props.active === true ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+    },
+  },
+  createElement('path', {
+    fill: 'currentColor',
+    d: 'M2.5 2.5h11a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-9a1 1 0 0 1 1-1Zm.5 2v1h2v-1H3Zm3.5 0v1H13v-1H6.5Zm-3.5 3v1h2v-1H3Zm3.5 0v1H13v-1H6.5Zm-3.5 3v1h2v-1H3Zm3.5 0v1H13v-1H6.5Z',
+  }))
 }
 
 /** Section wrapper for the drawer. */
@@ -606,7 +705,7 @@ function TaskDrawer(props: SurfaceProps): ReactNode | null {
       }, '删除任务'))
   }
 
-  return createElement(Fragment, null,
+  return createElement('div', { className: 'dt-modal' },
     createElement('div', { className: 'dt-backdrop', onClick: close }),
     createElement('div', { className: 'dt-drawer', role: 'dialog', 'aria-label': title },
       createElement('div', { className: 'dt-drawer-head' },
@@ -634,11 +733,19 @@ function TaskDrawer(props: SurfaceProps): ReactNode | null {
 export function registerTaskCenterUi(options: TaskCenterUiOptions): () => void {
   const store = createStore(options.api)
   const disposers: Array<() => void> = []
+  const openTasks = options.openTasks
   options.insertStyles?.(CSS)
 
   for (const seat of [
     { key: 'conversation.input.dock', options: { name: 'conversation.input.dock', id: 'tasks', order: 1 }, view: HomeDock },
-    { key: 'conversation.session.header.utilities', options: { name: 'conversation.session.header.utilities', id: 'tasks', order: 20 }, view: SessionTasksButton },
+    {
+      key: 'conversation.session.header.utilities',
+      options: {
+        name: 'conversation.session.header.utilities', id: 'tasks', order: 20,
+        inject: () => ({ openTasks: () => { openTasks?.() } }),
+      },
+      view: SessionTasksButton,
+    },
     { key: 'sidebar.panellist', options: { name: 'sidebar.panellist', id: 'tasks', order: 20, label: '任务' }, view: PanelIcon },
     { key: 'main', options: { name: 'main', key: 'tasks' }, view: TaskCenter },
     { key: 'shell.overlay', options: { name: 'shell.overlay', id: 'tasks-drawer', order: 100 }, view: TaskDrawer },
