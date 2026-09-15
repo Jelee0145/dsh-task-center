@@ -174,6 +174,8 @@ export interface TaskCenterHostContext {
   readonly tools: { register(definition: TaskToolDefinition): () => void }
   effect(callback: () => (() => void) | void): () => void
   get(name: string): unknown
+  /** Cordis child-fiber injection: run `callback` once every dependency exists. */
+  inject?(dependencies: readonly string[], callback: (scope: TaskCenterHostContext) => void): void
 }
 
 /** Deployment configuration accepted by {@link apply}. */
@@ -268,11 +270,6 @@ async function collectChoices(ctx: TaskCenterHostContext): Promise<{ workspaces:
  * @param center - the running engine the bridge mutates.
  */
 export function registerBridgeRoute(ctx: TaskCenterHostContext, center: TaskCenter): void {
-  const server = ctx.get('webServer') as WebServerLike | undefined
-  if (server === undefined || server === null || typeof server.register !== 'function') {
-    console.error('task-center: no webServer service; the browser half will have no data')
-    return
-  }
   const host: BridgeHost = {
     store: center.store,
     wake: () => { center.scheduler.wake() },
@@ -292,11 +289,31 @@ export function registerBridgeRoute(ctx: TaskCenterHostContext, center: TaskCent
       sendJson(res, 400, { ok: false, error: messageOf(error) })
     }
   }
-  try {
-    ctx.effect(() => server.register({ kind: 'exact', path: BRIDGE_PATH, handler }))
-  } catch (error) {
-    console.error(`task-center: bridge route was rejected: ${messageOf(error)}`)
+  const install = (scope: TaskCenterHostContext): void => {
+    const server = scope.get('webServer') as WebServerLike | undefined
+    if (server === undefined || server === null || typeof server.register !== 'function') {
+      console.error('task-center: no webServer service; the browser half will have no data')
+      return
+    }
+    try {
+      scope.effect(() => server.register({ kind: 'exact', path: BRIDGE_PATH, handler }))
+    } catch (error) {
+      console.error(`task-center: bridge route was rejected: ${messageOf(error)}`)
+    }
   }
+  // The carrier usually activates after this row, so reading it once at apply
+  // time loses the race. Waiting through a child fiber is the difference
+  // between a mounted UI with data and one that mounts empty forever.
+  const immediate = ctx.get('webServer')
+  if (immediate !== undefined && immediate !== null) {
+    install(ctx)
+    return
+  }
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], child => { install(child) })
+    return
+  }
+  install(ctx)
 }
 
 /**
